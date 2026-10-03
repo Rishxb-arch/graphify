@@ -83,3 +83,68 @@ def _file_stem(path: Path) -> str:
 
 def _read_text(node, source: bytes) -> str:
     return source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
+
+
+def callable_label_name(label: str) -> str:
+    """Bare name of a function or method label (``.bark()`` / ``bark()`` -> ``bark``)."""
+    return str(label).strip("()").lstrip(".")
+
+
+def index_methods_by_class(
+    nodes: list,
+    edges: list,
+) -> tuple[dict[str, str], dict[tuple[str, str], str]]:
+    """Index ``method`` edges the extractor has already emitted.
+
+    Returns ``(method_nid -> class_nid, (class_nid, method_name) -> method_nid)``.
+    A repeated name on one class keeps the last edge, which is the same
+    last-definition rule the file-wide label map used *within* a single class.
+    """
+    by_id = {
+        n.get("id"): n for n in nodes if isinstance(n, dict) and n.get("id")
+    }
+    owner: dict[str, str] = {}
+    by_class: dict[tuple[str, str], str] = {}
+    for edge in edges:
+        if not isinstance(edge, dict) or edge.get("relation") != "method":
+            continue
+        src, tgt = edge.get("source"), edge.get("target")
+        if not src or not tgt:
+            continue
+        owner[str(tgt)] = str(src)
+        node = by_id.get(tgt)
+        if node is None:
+            continue
+        name = callable_label_name(str(node.get("label", "")))
+        if name:
+            by_class[(str(src), name)] = str(tgt)
+    return owner, by_class
+
+
+def resolve_own_class_method(
+    caller_nid: str,
+    callee_name: str,
+    method_owner: dict[str, str],
+    methods_by_class: dict[tuple[str, str], str],
+    unscoped: str | None,
+) -> tuple[bool, str | None]:
+    """Bind a same-class call using ``method`` edges, not the file-wide name map.
+
+    When ``caller_nid`` is a method of class C, the callee resolves to C's own
+    method of that name. If C does not define it, a file-wide hit that belongs
+    to a *different* class is dropped (``None``) rather than used. A hit that
+    is not a method — a module-level function — is kept.
+
+    ``(False, None)`` means the caller is not a method; keep the unscoped lookup.
+    """
+    owner = method_owner.get(caller_nid)
+    if not owner:
+        return False, None
+    own = methods_by_class.get((owner, callee_name))
+    if own:
+        return True, own
+    if unscoped:
+        other = method_owner.get(unscoped)
+        if other is not None and other != owner:
+            return True, None
+    return True, unscoped

@@ -3,7 +3,14 @@ from __future__ import annotations
 
 
 from pathlib import Path
-from graphify.extractors.base import _LANGUAGE_BUILTIN_GLOBALS, _file_stem, _make_id, _read_text
+from graphify.extractors.base import (
+    _LANGUAGE_BUILTIN_GLOBALS,
+    _file_stem,
+    _make_id,
+    _read_text,
+    index_methods_by_class,
+    resolve_own_class_method,
+)
 
 
 # Rust prelude / std types. Language-local (like _GO_PREDECLARED_FUNCS and
@@ -628,6 +635,7 @@ def extract_rust(path: Path) -> dict:
         raw = n["label"]
         normalised = raw.strip("()").lstrip(".")
         label_to_nid[normalised] = n["id"]
+    _method_owner, _methods_by_class = index_methods_by_class(nodes, edges)
 
     # Nodes whose label has no `()` suffix are data definitions (structs, enums,
     # traits, statics), not callables. In Rust `Foo(x)` / `Foo { .. }` onto one
@@ -678,6 +686,18 @@ def extract_rust(path: Path) -> dict:
                 and (callee_name not in _RUST_BUILTIN_TYPES or callee_name in local_types)
             ):
                 tgt_nid = label_to_nid.get(callee_name)
+                # `self.bark()` belongs to this impl. Another type's `bark` in
+                # the same file must not win via the file-wide label map.
+                if is_self_call and callee_name:
+                    handled, scoped = resolve_own_class_method(
+                        caller_nid,
+                        callee_name,
+                        _method_owner,
+                        _methods_by_class,
+                        tgt_nid,
+                    )
+                    if handled:
+                        tgt_nid = scoped
                 if tgt_nid and tgt_nid != caller_nid:
                     pair = (caller_nid, tgt_nid)
                     if pair not in seen_call_pairs:

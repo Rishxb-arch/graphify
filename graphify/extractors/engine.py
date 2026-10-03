@@ -4,7 +4,14 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
-from graphify.extractors.base import _LANGUAGE_BUILTIN_GLOBALS, _file_stem, _make_id, _read_text
+from graphify.extractors.base import (
+    _LANGUAGE_BUILTIN_GLOBALS,
+    _file_stem,
+    _make_id,
+    _read_text,
+    index_methods_by_class,
+    resolve_own_class_method,
+)
 from graphify.ids import normalize_id
 from graphify.extractors.models import LanguageConfig
 from graphify.extractors.resolution import _resolve_js_import_target
@@ -6171,6 +6178,98 @@ def _extract_generic(
     for _e in edges:
         if _e.get("relation") == "inherits":
             _local_bases.setdefault(_e["source"], []).append(_e["target"])
+    # Same-class call resolution. `label_to_nid` is one file-wide map, so a later
+    # class's `bark` overwrites an earlier one and `self.bark()` / `this.bark()` /
+    # a bare `bark()` inside Dog binds to Cat.bark. Method edges already record
+    # which class owns each method; consult those instead of the file-wide map
+    # when the call is receiver-less implicit-this or on self/this/cls.
+    _method_owner, _methods_by_class = index_methods_by_class(nodes, edges)
+    _heritage: dict[str, list[str]] = {}
+    for _e in edges:
+        if _e.get("relation") in ("inherits", "mixes_in"):
+            _h_src, _h_tgt = _e.get("source"), _e.get("target")
+            if _h_src and _h_tgt:
+                _heritage.setdefault(_h_src, []).append(_h_tgt)
+
+    def _ancestor_classes(class_nid: str) -> set[str]:
+        seen: set[str] = set()
+        queue = list(_heritage.get(class_nid, []))
+        while queue:
+            base = queue.pop()
+            if base in seen:
+                continue
+            seen.add(base)
+            queue.extend(_heritage.get(base, []))
+        return seen
+
+    # Receivers the existing defer rules already treat as staying on this class.
+    # Python keeps self/cls/super on the in-file map; Java/C#/Kotlin/Swift/C++/Scala
+    # bare calls are implicit this; a Ruby call with no receiver is implicit self.
+    _SELF_RECEIVERS = {"self", "cls", "this", "$this"}
+    _SUPER_RECEIVERS = {"super", "base", "parent"}
+    _IMPLICIT_THIS = {
+        "tree_sitter_java",
+        "tree_sitter_c_sharp",
+        "tree_sitter_kotlin",
+        "tree_sitter_swift",
+        "tree_sitter_cpp",
+        "tree_sitter_scala",
+    }
+    # `new Foo()` names a type, not an implicit-this method. Scoping it onto a
+    # same-named method of the enclosing class would steal the constructor edge.
+    _CONSTRUCTOR_CALLS = {
+        "object_creation_expression",
+        "new_expression",
+        "implicit_object_creation_expression",
+    }
+
+    def _scope_same_class_call(
+        caller_nid: str,
+        callee_name: str,
+        unscoped: str | None,
+        *,
+        is_member_call: bool,
+        member_receiver: str | None,
+        ruby_bare_self_send: bool,
+    ) -> str | None:
+        if caller_nid not in _method_owner:
+            return unscoped
+        if ruby_bare_self_send or (
+            not is_member_call and config.ts_module == "tree_sitter_ruby"
+        ) or (
+            not is_member_call and config.ts_module in _IMPLICIT_THIS
+        ) or (
+            is_member_call and member_receiver in _SELF_RECEIVERS
+        ):
+            handled, scoped = resolve_own_class_method(
+                caller_nid, callee_name, _method_owner, _methods_by_class, unscoped,
+            )
+            if not handled:
+                return unscoped
+            # The class does not define it. Keep the file-wide hit only when it
+            # is already an ancestor (inherits / mixes_in). An unrelated class
+            # is dropped instead of winning because it was declared last.
+            if scoped is None and unscoped:
+                owner = _method_owner.get(caller_nid)
+                cand_owner = _method_owner.get(unscoped)
+                if owner and cand_owner and cand_owner in _ancestor_classes(owner):
+                    return unscoped
+            return scoped
+        if is_member_call and member_receiver in _SUPER_RECEIVERS:
+            # Keep super()/base on the unscoped hit only when that hit is this
+            # class, an ancestor, or not a method. An unrelated class in the
+            # same file must not win just because it was declared last.
+            owner = _method_owner.get(caller_nid)
+            cand_owner = _method_owner.get(unscoped) if unscoped else None
+            if (
+                cand_owner is None
+                or owner is None
+                or cand_owner == owner
+                or cand_owner in _ancestor_classes(owner)
+            ):
+                return unscoped
+            return None
+        return unscoped
 
     def _fields_up_chain(tables: dict, class_nid) -> dict:
         if not class_nid:
@@ -6721,6 +6820,9 @@ def _extract_generic(
                     name_node = node.child_by_field_name("name")
                     if name_node:
                         callee_name = _read_text(name_node, source)
+                    obj = node.child_by_field_name("object")
+                    if obj is not None and _read_text(obj, source) == "$this":
+                        member_receiver = "$this"
             elif config.ts_module == "tree_sitter_cpp":
                 # C++: function field, then field_expression/qualified_identifier
                 func_node = node.child_by_field_name(config.call_function_field) if config.call_function_field else None
@@ -6792,6 +6894,8 @@ def _extract_generic(
                     is_member_call = True
                     if recv.type in ("identifier", "constant"):
                         member_receiver = _read_text(recv, source)
+                    elif recv.type == "self":
+                        member_receiver = "self"
                     elif recv.type == "scope_resolution":
                         # Namespaced receiver `Billing::Processor.call` — keep the whole
                         # constant path. Truncating to the last segment discarded the
@@ -6838,6 +6942,10 @@ def _extract_generic(
                             obj = func_node.child_by_field_name(config.call_accessor_object_field)
                             if obj is not None and obj.type == "identifier":
                                 member_receiver = _read_text(obj, source)
+                            elif obj is not None and obj.type in ("this", "this_expression"):
+                                member_receiver = "this"
+                            elif obj is not None and obj.type == "super":
+                                member_receiver = "super"
                             elif (
                                 config.ts_module == "tree_sitter_python"
                                 and obj is not None
@@ -6965,6 +7073,15 @@ def _extract_generic(
                             tgt_nid = label_to_nid.get(callee_name)
                     else:
                         tgt_nid = label_to_nid.get(callee_name)
+                    if node.type not in _CONSTRUCTOR_CALLS:
+                        tgt_nid = _scope_same_class_call(
+                            caller_nid,
+                            callee_name,
+                            tgt_nid,
+                            is_member_call=is_member_call,
+                            member_receiver=member_receiver,
+                            ruby_bare_self_send=_ruby_bare_self_send,
+                        )
                     # A qualified `new A.B.Foo()` whose bare name matches only a
                     # sourceless stub in this file would bind the call to the stub
                     # and never reach _resolve_csharp_qualified_calls, the one pass

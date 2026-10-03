@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from graphify.extractors.base import _LANGUAGE_BUILTIN_GLOBALS, _file_stem, _make_id, _read_text
+from graphify.extractors.base import (
+    _LANGUAGE_BUILTIN_GLOBALS,
+    _file_stem,
+    _make_id,
+    _read_text,
+    index_methods_by_class,
+    resolve_own_class_method,
+)
 
 
 _GO_PREDECLARED_TYPES = frozenset({
@@ -108,6 +115,8 @@ def extract_go(path: Path) -> dict:
     edges: list[dict] = []
     seen_ids: set[str] = set()
     function_bodies: list[tuple[str, object]] = []
+    # method nid -> the receiver variable (`d` in `func (d Dog) Speak`).
+    go_receiver_var: dict[str, str] = {}
     # local package name (including aliases) -> written Go import path
     go_imported_pkgs: dict[str, str] = {}
 
@@ -304,10 +313,14 @@ def extract_go(path: Path) -> dict:
         if t == "method_declaration":
             receiver = node.child_by_field_name("receiver")
             receiver_type: str | None = None
+            recv_var: str | None = None
             if receiver:
                 for param in receiver.children:
                     if param.type == "parameter_declaration":
+                        name_node_recv = param.child_by_field_name("name")
                         type_node = param.child_by_field_name("type")
+                        if name_node_recv is not None:
+                            recv_var = _read_text(name_node_recv, source)
                         if type_node:
                             receiver_type = _read_text(type_node, source).lstrip("*").strip()
                         break
@@ -323,6 +336,8 @@ def extract_go(path: Path) -> dict:
                 method_nid = symbol_nid(_make_id(parent_nid, method_name), method_name)
                 add_node(method_nid, f".{method_name}()", line)
                 add_edge(parent_nid, method_nid, "method", line)
+                if recv_var:
+                    go_receiver_var[method_nid] = recv_var
             else:
                 method_nid = symbol_nid(_make_id(stem, method_name), method_name)
                 add_node(method_nid, f"{method_name}()", line)
@@ -478,6 +493,7 @@ def extract_go(path: Path) -> dict:
         raw = n["label"]
         normalised = raw.strip("()").lstrip(".")
         label_to_nid[normalised] = n["id"]
+    _method_owner, _methods_by_class = index_methods_by_class(nodes, edges)
 
     seen_call_pairs: set[tuple[str, str]] = set()
     raw_calls: list[dict] = []
@@ -492,6 +508,7 @@ def extract_go(path: Path) -> dict:
             is_bare_identifier: bool = False
             package_receiver: str | None = None
             import_path: str | None = None
+            receiver_name = ""
             if func_node:
                 if func_node.type == "identifier":
                     is_bare_identifier = True
@@ -517,6 +534,25 @@ def extract_go(path: Path) -> dict:
             if callee_name and callee_name not in _LANGUAGE_BUILTIN_GLOBALS:
                 # Never resolve an imported selector through a bare local name.
                 tgt_nid = None if import_path else label_to_nid.get(callee_name)
+                # `d.Bark()` where `d` is this method's receiver is a same-type
+                # call. Do not let another type's `Bark` in this file win.
+                recv_var = go_receiver_var.get(caller_nid)
+                if (
+                    not import_path
+                    and is_member_call
+                    and callee_name
+                    and recv_var
+                    and receiver_name == recv_var
+                ):
+                    handled, scoped = resolve_own_class_method(
+                        caller_nid,
+                        callee_name,
+                        _method_owner,
+                        _methods_by_class,
+                        tgt_nid,
+                    )
+                    if handled:
+                        tgt_nid = scoped
                 if tgt_nid and tgt_nid != caller_nid:
                     pair = (caller_nid, tgt_nid)
                     if pair not in seen_call_pairs:

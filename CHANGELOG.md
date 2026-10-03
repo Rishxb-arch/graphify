@@ -2,6 +2,10 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/Graphify-Labs/graphify/releases)
 
+## Unreleased
+
+- Fix: a receiver-less call or a `self`/`cls`/`this` call inside a method resolves to that method's own class when the class defines the callee. A same-named method of an unrelated class in the file no longer wins just because it was declared last, and that guess is no longer tagged `EXTRACTED`. If the class does not define the callee, an unrelated class is left unresolved; a hit that is already an ancestor (`inherits` / `mixes_in`) is kept. Module-level functions and `super()`/`base` calls to an ancestor are unchanged. Go receiver calls (`d.Method()`) and Rust `self.method()` follow the same rule.
+
 ## 0.9.74 (2026-10-02)
 
 - Feature: four more language extractors gained structural depth. **Ruby** paren-less self-sends (`do_thing` with no receiver or parens) are now captured as calls, with a local-variable/parameter/block-parameter in scope correctly suppressing the call (fail-closed, no fabrication) (#3960, thanks @rajatnagda45). **TypeScript** `abstract` method signatures in an abstract class are now extracted as callable method members and resolve as call targets (#3961, thanks @rajatnagda45). **Scala** deferred (abstract) method declarations in traits and abstract classes (`def foo: Int`, no body) are now extracted as methods (#3962, thanks @rajatnagda45). **C++** a member-function declaration inside a class (`void foo();`, defined out-of-line) is now classified as a method rather than a field, including pure-virtual, `const`, operator, and destructor forms; real data members stay fields (#3963, thanks @rajatnagda45).
